@@ -6,16 +6,22 @@ use App\Models\EmployeeProfile;
 use App\Models\Position;
 use App\Models\ReviewLog;
 use App\Models\Ticket;
+use App\Models\TicketActivity;
 use App\Models\WansisReport;
 use App\Services\ApprovalService;
+use App\Services\TicketActivityLogger;
 use App\Services\WansisService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
 class ApprovalController extends Controller
 {
+    /** Berapa tiket tertua yang dikirim ke dasbor approver. */
+    private const OLDEST_LIMIT = 5;
+
     public function __construct(
         private readonly ApprovalService $approvalService,
         private readonly WansisService $wansisService,
@@ -66,12 +72,23 @@ class ApprovalController extends Controller
             ]);
 
         if ($stage === 'HISTORY') {
-            // Tiket yang pernah diproses approver ini (approve / reject)
+            // Tiket yang pernah diputuskan approver ini (approve / reject).
             $query->whereHas('reviewLogs', function ($q) use ($employee) {
                 $q->where('reviewer_employee_id', $employee->id)
                     ->whereIn('review_type', ['APPROVAL_FINAL', 'APPROVAL_INITIAL'])
                     ->whereIn('decision', ['APPROVE', 'REJECT']);
             });
+
+            // WAJIB: proses persetujuan baru selesai bila tiketnya terminal
+            // (CLOSED / REJECTED).
+            //
+            // Tanpa filter ini, `whereHas(reviewLogs)` saja sudah cukup untuk
+            // membuat tiket tampil di arsip begitu approval AWAL disetujui —
+            // padahal approval itu dua tahap, dan tiket masih berjalan di
+            // unit/handler sebelum approval PENUTUPAN. Akibatnya tiket
+            // PENDING_REVIEW maupun IN_PROGRESS ikut muncul di "Arsip &
+            // Riwayat" padahal belum selesai.
+            $query->whereHas('status', fn ($q) => $q->where('is_terminal', true));
         } else {
             $statusCode = $stage === 'FINAL' ? 'PENDING_REVIEW' : 'PENDING_APPROVAL';
 
@@ -87,6 +104,150 @@ class ApprovalController extends Controller
         $tickets = $query->latest()->paginate($perPage);
 
         return response()->json($tickets);
+    }
+
+    /**
+     * GET /api/auth/approver/summary
+     *
+     * Satu request untuk seluruh angka dasbor approver.
+     *
+     * Kenapa tidak cukup pakai `index()`: kartu KPI di dasbor memakai
+     * `initial.length` dan `final.length`, yaitu **jumlah baris di halaman
+     * pertama** (`per_page` default 20), bukan total. Begitupun `latest()`
+     * mengurut terbaru dulu, sehingga angkanya bukan cuma terpotong, tapi juga
+     * mengambil sampel yang paling baru — kebalikan dari yang biasanya dicari.
+     *
+     * - kpi: antrean per tahap (count asli) + keputusan bulan berjalan
+     * - oldest_pending: 5 tiket tertua gabungan INITIAL & FINAL
+     * - avg_decision_hours: rata-rata lama dari tiket dibuat sampai diputuskan
+     * - by_stage: persetujuan vs penolakan per tahap
+     *
+     * Angka "selesai" & "ditolak" sengaja dihitung **sejak awal bulan**,
+     * bukan sepanjang waktu, supaya cocok dengan yang dipantau harian.
+     */
+    public function summary(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $employee = $user?->employeeProfile;
+
+        if (! $employee) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Approver harus seorang pegawai.',
+            ], 403);
+        }
+
+        $employeeId = $employee->id;
+        $monthStart = Carbon::now()->startOfMonth();
+        $approvalTypes = $this->approvalTypesForEmployee($employee);
+
+        // Antrean yang memang boleh diputuskan oleh approver ini: statusnya
+        // cocok tahap DAN approval_type-nya cocok posisinya.
+        $pendingQuery = function (string $statusCode) use ($approvalTypes) {
+            return Ticket::query()
+                ->whereHas('status', fn ($q) => $q->where('code', $statusCode))
+                ->where(function ($q) use ($approvalTypes) {
+                    $q->whereNull('approval_type')
+                        ->orWhereIn('approval_type', $approvalTypes);
+                });
+        };
+
+        $initialPending = $pendingQuery('PENDING_APPROVAL')->count();
+        $finalPending = $pendingQuery('PENDING_REVIEW')->count();
+
+        // Keputusan approver ini bulan berjalan.
+        $myDecisions = DB::table('review_logs')
+            ->where('reviewer_employee_id', $employeeId)
+            ->whereIn('review_type', ['APPROVAL_INITIAL', 'APPROVAL_FINAL'])
+            ->where('reviewed_at', '>=', $monthStart);
+
+        $approvedThisMonth = (clone $myDecisions)->where('decision', 'APPROVE')->count();
+        $rejectedThisMonth = (clone $myDecisions)->where('decision', 'REJECT')->count();
+
+        // ── 5 tiket tertua, gabungan kedua tahap ──────────────────────
+        // Digabung karena dasbor menampilkan keduanya dalam satu tabel. Kalau
+        // dipisah, INITIAL yang jumlahnya lebih besar akan mengisi seluruh slot
+        // dan tiket approval penutupan yang paling lama bisa tidak pernah muncul.
+        $oldestPending = collect([
+            ['status' => 'PENDING_APPROVAL', 'stage' => 'INITIAL'],
+            ['status' => 'PENDING_REVIEW', 'stage' => 'FINAL'],
+        ])
+            ->flatMap(function (array $bucket) use ($pendingQuery) {
+                return $pendingQuery($bucket['status'])
+                    ->with([
+                        'ticketType:id,code',
+                        'priority:id,code',
+                        'salesDetail:id,ticket_id,so_number',
+                        'reporterUser:id,full_name',
+                    ])
+                    ->orderBy('created_at')
+                    ->orderBy('id')
+                    ->limit(self::OLDEST_LIMIT)
+                    ->get()
+                    ->map(fn (Ticket $t) => [
+                        'stage' => $bucket['stage'],
+                        'ticket_no' => $t->ticket_no,
+                        'subject' => $t->subject,
+                        'ticket_type_code' => $t->ticketType?->code,
+                        'priority_code' => $t->priority?->code,
+                        'reporter_name' => $t->reporterUser?->full_name ?? 'Pengguna',
+                        'so_number' => $t->salesDetail?->so_number,
+                        'created_at' => $t->created_at?->toIso8601String(),
+                        'age_days' => (int) $t->created_at->startOfDay()->diffInDays(Carbon::now()->startOfDay()),
+                    ]);
+            })
+            ->sortBy('age_days')
+            ->take(self::OLDEST_LIMIT)
+            ->values();
+
+        // ── Rata-rata lama menunggu keputusan ────────────────────────
+        $durations = DB::table('review_logs as rl')
+            ->join('tickets as t', 't.id', '=', 'rl.ticket_id')
+            ->where('rl.reviewer_employee_id', $employeeId)
+            ->whereIn('rl.review_type', ['APPROVAL_INITIAL', 'APPROVAL_FINAL'])
+            ->limit(1000)
+            ->get(['t.created_at', 'rl.reviewed_at'])
+            ->map(function ($row): float {
+                // `created->diffInHours(reviewed)` = reviewed - created.
+                // Urutannya penting: dibalik hasilnya negatif dan metriknya
+                // selalu keluar "0 jam".
+                $diff = Carbon::parse($row->created_at)->diffInHours(Carbon::parse($row->reviewed_at), false);
+
+                return $diff > 0 ? (float) $diff : 0.0;
+            })
+            ->sort()
+            ->values();
+
+        // ── Breakdown per tahap ───────────────────────────────────────
+        $byStage = DB::table('review_logs')
+            ->select('review_type', 'decision', DB::raw('COUNT(*) AS total'))
+            ->where('reviewer_employee_id', $employeeId)
+            ->whereIn('review_type', ['APPROVAL_INITIAL', 'APPROVAL_FINAL'])
+            ->groupBy('review_type', 'decision')
+            ->get()
+            ->reduce(function (array $carry, $row) {
+                $stage = $row->review_type === 'APPROVAL_FINAL' ? 'final' : 'initial';
+                $key = $row->decision === 'APPROVE' ? 'approve' : 'reject';
+                $carry[$stage][$key] = (int) $row->total;
+
+                return $carry;
+            }, ['initial' => ['approve' => 0, 'reject' => 0], 'final' => ['approve' => 0, 'reject' => 0]]);
+
+        return response()->json([
+            'kpi' => [
+                'initial_pending' => $initialPending,
+                'final_pending' => $finalPending,
+                'total_pending' => $initialPending + $finalPending,
+                'approved_this_month' => $approvedThisMonth,
+                'rejected_this_month' => $rejectedThisMonth,
+            ],
+            'oldest_pending' => $oldestPending,
+            'avg_decision_hours' => $durations->isEmpty() ? null : round((float) $durations->avg(), 1),
+            'decision_sample' => $durations->count(),
+            'by_stage' => $byStage,
+            'month_start' => $monthStart->toIso8601String(),
+            'generated_at' => now()->toIso8601String(),
+        ]);
     }
 
     /**
@@ -150,7 +311,7 @@ class ApprovalController extends Controller
         // commit (lihat akhir method decide()).
         $wansisTicketId = null;
 
-        DB::transaction(function () use ($ticket, $employee, $stage, $decision, $validated, &$wansisTicketId) {
+        DB::transaction(function () use ($ticket, $user, $employee, $stage, $decision, $expectedStatus, $validated, &$wansisTicketId) {
             // ── 1. Untuk FINAL, update resolusi PENDING menjadi APPROVED/REJECTED ──
             $resolutionId = null;
             if ($stage === 'FINAL') {
@@ -226,6 +387,28 @@ class ApprovalController extends Controller
                     ]);
                 }
             }
+
+            // ── 4. Timeline aktivitas (di dalam transaksi yang sama) ──
+            $activityType = match (true) {
+                $stage === 'INITIAL' && $decision === 'APPROVE' => TicketActivity::TYPE_APPROVED_INITIAL,
+                $stage === 'INITIAL' => TicketActivity::TYPE_REJECTED_INITIAL,
+                $decision === 'APPROVE' => TicketActivity::TYPE_APPROVED_FINAL,
+                default => TicketActivity::TYPE_REWORK_REQUESTED,
+            };
+            $activityDescription = match (true) {
+                $stage === 'INITIAL' && $decision === 'APPROVE' => 'Tiket disetujui. Diteruskan ke unit untuk ditindaklanjuti.',
+                $stage === 'INITIAL' => 'Tiket ditolak approver.',
+                $decision === 'APPROVE' => 'Resolusi disetujui. Tiket ditutup.',
+                default => 'Resolusi ditolak. Tiket dikembalikan ke handler.',
+            };
+            TicketActivityLogger::record(
+                $ticket,
+                $activityType,
+                $user->id,
+                $activityDescription,
+                ['status' => $expectedStatus],
+                ['status' => $ticket->fresh()->status->code ?? null],
+            );
         });
 
         // Kirim ke WANSIS SETELAH transaksi commit. Best-effort: kegagalan

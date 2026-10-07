@@ -7,9 +7,9 @@ use App\Models\Customer;
 use App\Models\EmployeeProfile;
 use App\Models\HandlerProgressEntry;
 use App\Models\PriorityLevel;
-use App\Models\Product;
 use App\Models\ReviewLog;
 use App\Models\Ticket;
+use App\Models\TicketActivity;
 use App\Models\TicketAttachment;
 use App\Models\TicketRelation;
 use App\Models\TicketRevision;
@@ -21,6 +21,7 @@ use App\Models\User;
 use App\Services\ApprovalService;
 use App\Services\AuthServiceClient;
 use App\Services\PhoneNumber;
+use App\Services\TicketActivityLogger;
 use App\Services\UserSyncService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -48,7 +49,7 @@ class TicketController extends Controller
             'ticketType',
             'priority',
             'status',
-            'vehicleDetail.product',
+            'vehicleDetail',
             'salesDetail',
             'relations.relatedTicket',
             'action',
@@ -170,11 +171,11 @@ class TicketController extends Controller
             $query->where('ticket_type_id', $request->input('ticket_type_id'));
         }
 
-        // Filter by product line (vehicle details)
-        if ($request->filled('product_id')) {
-            $productId = $request->input('product_id');
-            $query->whereHas('vehicleDetail', function ($q) use ($productId) {
-                $q->where('product_id', $productId);
+        // Filter by lini produk = kode grup WANSIS (vehicle details)
+        if ($request->filled('product_group_code')) {
+            $groupCode = $request->input('product_group_code');
+            $query->whereHas('vehicleDetail', function ($q) use ($groupCode) {
+                $q->where('group_code', $groupCode);
             });
         }
 
@@ -223,17 +224,22 @@ class TicketController extends Controller
             'ticketType',
             'priority',
             'status',
-            'vehicleDetail.product',
+            'vehicleDetail',
             'salesDetail',
             'relations.relatedTicket',
             'action',
             'latestRevision',
             'latestReviewLog.destinationDepartment',
+            // Nomor report WANSIS (hanya untuk klaim distribusi). Kolom lain
+            // sengaja tidak diambil — `payload_json`/`response_json` berukuran
+            // besar dan tidak dipakai UI.
+            'wansisReports:id,ticket_id,wansis_report_id',
             'assignments.assignedToEmployee.user',
             'assignments.assignedByEmployee.user',
             'resolutions.attachments',
             'resolutions.reviewLog',
             'resolutions.submittedBy',
+            'activities.actor:id,full_name',
         ])->with(['attachments' => function ($query) {
             // Hanya attachment yang langsung terkait ke ticket (lampiran pelapor saat pembuatan laporan)
             $query->whereNull('attachable_type')
@@ -330,9 +336,9 @@ class TicketController extends Controller
             'customer_address' => 'nullable|string',
             'customer_id' => 'nullable|exists:customers,id',
 
-            // Vehicle detail
-            'product_id' => 'nullable|exists:products,id',
-            'product_line' => 'nullable|string|max:255',
+            // Vehicle detail — lini produk = kode grup WANSIS (bukan FK lokal;
+            // master tunggal ada di SAP). Tanpa lookup nama.
+            'product_group_code' => 'nullable|string|max:50',
             'vehicle_model' => 'nullable|string|max:255',
 
             // Sales / Claims detail
@@ -347,7 +353,7 @@ class TicketController extends Controller
 
             // Attachments
             'attachments' => 'nullable|array|max:10',
-            'attachments.*' => 'nullable|file|mimes:jpg,jpeg,png,pdf|max:10240',
+            'attachments.*' => 'nullable|file|mimes:jpg,jpeg,png,pdf,mp4,webm|max:10240',
         ]);
 
         $user = $request->user();
@@ -590,21 +596,14 @@ class TicketController extends Controller
                 'approval_type' => $request->input('approval_type'),
             ]);
 
-            // 10. Vehicle detail
-            $productId = $request->input('product_id');
-            if (! $productId && $request->filled('product_line')) {
-                $prod = Product::where('name', $request->product_line)
-                    ->orWhere('code', $request->product_line)
-                    ->first();
-                if ($prod) {
-                    $productId = $prod->id;
-                }
-            }
+            // 10. Vehicle detail — simpan kode grup apa adanya, tanpa
+            // lookup nama (anti-pola Product::where('name', ...)).
+            $groupCode = $request->input('product_group_code');
             $vehicleModel = $request->input('vehicle_model');
-            if ($productId || $vehicleModel) {
+            if ($groupCode || $vehicleModel) {
                 TicketVehicleDetail::create([
                     'ticket_id' => $ticket->id,
-                    'product_id' => $productId,
+                    'group_code' => $groupCode,
                     'vehicle_model' => $vehicleModel,
                 ]);
             }
@@ -664,6 +663,13 @@ class TicketController extends Controller
 
             DB::commit();
 
+            TicketActivityLogger::record(
+                $ticket,
+                TicketActivity::TYPE_CREATED,
+                $ticket->reporter_user_id,
+                'Laporan dibuat.',
+            );
+
             return response()->json([
                 'message' => 'Tiket berhasil dibuat',
                 'data' => $ticket->load([
@@ -673,7 +679,7 @@ class TicketController extends Controller
                     'ticketType',
                     'priority',
                     'status',
-                    'vehicleDetail.product',
+                    'vehicleDetail',
                     'salesDetail',
                     'relations.relatedTicket',
                     'attachments',
@@ -705,7 +711,7 @@ class TicketController extends Controller
             'subject' => 'sometimes|string|max:255',
             'description' => 'sometimes|string',
             'approval_type' => 'sometimes|in:DIREKSI,GENERAL_MANAGER,OPERATIONAL_MANAGER,DIVISION',
-            'product_id' => 'sometimes|nullable|exists:products,id',
+            'product_group_code' => 'sometimes|nullable|string|max:50',
             'vehicle_model' => 'sometimes|nullable|string|max:255',
             'so_number' => 'sometimes|nullable|string|max:255',
             'sales_name' => 'sometimes|nullable|string|max:255',
@@ -723,11 +729,11 @@ class TicketController extends Controller
         ])->toArray());
 
         // Update vehicle detail if provided
-        if ($request->has('product_id') || $request->has('vehicle_model')) {
+        if ($request->has('product_group_code') || $request->has('vehicle_model')) {
             $ticket->vehicleDetail()->updateOrCreate(
                 ['ticket_id' => $ticket->id],
                 [
-                    'product_id' => $request->product_id,
+                    'group_code' => $request->product_group_code,
                     'vehicle_model' => $request->vehicle_model,
                 ]
             );
@@ -754,28 +760,10 @@ class TicketController extends Controller
                 'ticketType',
                 'priority',
                 'status',
-                'vehicleDetail.product',
+                'vehicleDetail',
                 'salesDetail',
                 'latestRevision',
             ]),
-        ]);
-    }
-
-    /**
-     * Close / reject ticket
-     */
-    public function destroy($id)
-    {
-        $ticket = $this->findTicket($id);
-
-        $closedStatusId = TicketStatus::where('code', 'CLOSED')->value('id') ?? 6;
-        $ticket->update([
-            'status_id' => $closedStatusId,
-            'closed_at' => now(),
-        ]);
-
-        return response()->json([
-            'message' => 'Tiket berhasil ditutup',
         ]);
     }
 
@@ -822,7 +810,7 @@ class TicketController extends Controller
             'revisions.description' => 'nullable|string',
             'revisions.vehicle_detail' => 'nullable|array',
             'revisions.vehicle_detail.vehicle_model' => 'nullable|string|max:255',
-            'revisions.vehicle_detail.product_id' => 'nullable|exists:products,id',
+            'revisions.vehicle_detail.group_code' => 'nullable|string|max:50',
             'revisions.sales_detail' => 'nullable|array',
             'revisions.sales_detail.so_number' => 'nullable|string|max:255',
             'revisions.sales_detail.sales_name' => 'nullable|string|max:255',
@@ -835,7 +823,7 @@ class TicketController extends Controller
             'reporterUser.employeeProfile',
             'category',
             'status',
-            'vehicleDetail.product',
+            'vehicleDetail',
             'salesDetail',
         ]);
 
@@ -973,6 +961,25 @@ class TicketController extends Controller
         }
         $ticket->update($ticketUpdates);
 
+        $activityType = match ($decision) {
+            'ROUTE' => TicketActivity::TYPE_REVIEW_ROUTED,
+            'REQUEST_REWORK' => TicketActivity::TYPE_REVIEW_REWORK,
+            default => TicketActivity::TYPE_REVIEW_REJECTED,
+        };
+        $activityDescription = match ($decision) {
+            'ROUTE' => 'Tinjauan awal selesai. Tiket diteruskan ke approver ('.$validated['approval_type'].').',
+            'REQUEST_REWORK' => 'Tiket dikembalikan untuk diperbaiki.',
+            default => 'Laporan ditolak reviewer.',
+        };
+        TicketActivityLogger::record(
+            $ticket,
+            $activityType,
+            $user->id,
+            $activityDescription,
+            ['status' => 'OPEN'],
+            ['status' => $targetStatusCode],
+        );
+
         return response()->json([
             'success' => true,
             'message' => $decision === 'ROUTE'
@@ -982,7 +989,7 @@ class TicketController extends Controller
                     : 'Tiket berhasil ditolak.'),
             'data' => $ticket->fresh()->load([
                 'reporterUser', 'customer.user', 'category.parent', 'ticketType',
-                'priority', 'status', 'action', 'vehicleDetail.product', 'salesDetail',
+                'priority', 'status', 'action', 'vehicleDetail', 'salesDetail',
             ]),
         ]);
     }
@@ -1029,7 +1036,7 @@ class TicketController extends Controller
             'description' => $ticket->description,
             'vehicle_detail' => $vehicle ? [
                 'vehicle_model' => $vehicle->vehicle_model,
-                'product_id' => $vehicle->product_id,
+                'group_code' => $vehicle->group_code,
             ] : null,
             'sales_detail' => $sales ? [
                 'so_number' => $sales->so_number,
@@ -1043,6 +1050,14 @@ class TicketController extends Controller
      * Compute diff between origin and new values.
      * Only includes fields that actually changed.
      *
+     * Perbandingan dilakukan SETELAH normalisasi agar tidak menyimpan
+     * no-op diff:
+     * - skalar: bandingkan sebagai string (4 ≡ "4"), trim string,
+     *   null/'' dianggap sama (keduanya "kosong"),
+     * - array (claimed_items): normalisasi tiap item (buang key kosong,
+     *   samakan alias qty/quantity, urutkan key), urutkan item by id,
+     *   lalu bandingkan hasil json_encode-nya.
+     *
      * @return array<string, array{old: mixed, new: mixed}>
      */
     private function computeDiff(array $origin, array $new): array
@@ -1054,7 +1069,7 @@ class TicketController extends Controller
             'ticket_type_id',
             'category_id',
             'description',
-            'vehicle_detail' => ['vehicle_model', 'product_id'],
+            'vehicle_detail' => ['vehicle_model', 'group_code'],
             'sales_detail' => ['so_number', 'sales_name'],
             'claimed_items',
         ];
@@ -1065,7 +1080,7 @@ class TicketController extends Controller
                 $field = $subFields;
                 $oldVal = $origin[$field] ?? null;
                 $newVal = $new[$field] ?? null;
-                if ($oldVal !== $newVal && ($oldVal !== null || $newVal !== null)) {
+                if (! $this->sameScalar($oldVal, $newVal)) {
                     $diff[$field] = ['old' => $oldVal, 'new' => $newVal];
                 }
             } else {
@@ -1081,7 +1096,7 @@ class TicketController extends Controller
                 foreach ($subFields as $subField) {
                     $oldVal = is_array($oldNested) ? ($oldNested[$subField] ?? null) : null;
                     $newVal = is_array($newNested) ? ($newNested[$subField] ?? null) : null;
-                    if ($oldVal !== $newVal && ($oldVal !== null || $newVal !== null)) {
+                    if (! $this->sameScalar($oldVal, $newVal)) {
                         $nestedDiff[$subField] = ['old' => $oldVal, 'new' => $newVal];
                     }
                 }
@@ -1092,16 +1107,101 @@ class TicketController extends Controller
             }
         }
 
-        // claimed_items - compare as JSON string since it's array
-        $oldClaimed = $origin['claimed_items'] ?? [];
-        $newClaimed = $new['claimed_items'] ?? [];
-        $oldJson = json_encode($oldClaimed);
-        $newJson = json_encode($newClaimed);
-        if ($oldJson !== $newJson) {
-            $diff['claimed_items'] = ['old' => $oldClaimed, 'new' => $newClaimed];
+        // claimed_items - bandingkan SETELAH normalisasi (buang key kosong,
+        // samakan alias, urutkan) agar tidak menyimpan no-op diff.
+        $oldClaimed = $this->normalizeClaimItems($origin['claimed_items'] ?? []);
+        $newClaimed = $this->normalizeClaimItems($new['claimed_items'] ?? []);
+        if (json_encode($oldClaimed) !== json_encode($newClaimed)) {
+            $diff['claimed_items'] = ['old' => $origin['claimed_items'] ?? [], 'new' => $new['claimed_items'] ?? []];
         }
 
         return $diff;
+    }
+
+    /**
+     * Bandingkan dua nilai skalar secara semantik.
+     *
+     * - null dan '' dianggap sama (keduanya "kosong"),
+     * - angka vs numeric-string dianggap sama (4 ≡ "4"),
+     * - string di-trim sebelum dibandingkan.
+     */
+    private function sameScalar(mixed $old, mixed $new): bool
+    {
+        $oldEmpty = $old === null || $old === '';
+        $newEmpty = $new === null || $new === '';
+        if ($oldEmpty || $newEmpty) {
+            return $oldEmpty && $newEmpty;
+        }
+        if (is_numeric($old) && is_numeric($new)) {
+            return ((string) $old) === ((string) $new);
+        }
+        if (is_string($old) && is_string($new)) {
+            return trim($old) === trim($new);
+        }
+
+        return $old === $new;
+    }
+
+    /**
+     * Normalisasi daftar claimed_items untuk perbandingan diff.
+     *
+     * - tiap item: buang key kosong ('' / null), samakan alias
+     *   qty/quantity (quantity menang), urutkan key,
+     * - daftar: urutkan item berdasarkan kunci stabil (id, kode, nama)
+     *   agar urutan tidak dianggap perubahan.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function normalizeClaimItems(mixed $items): array
+    {
+        if (! is_array($items)) {
+            return [];
+        }
+        // Daftar asosiatif tunggal (bukan list) → bungkus jadi satu item.
+        if (! array_is_list($items)) {
+            $items = [$items];
+        }
+        $out = [];
+        foreach ($items as $raw) {
+            if (! is_array($raw)) {
+                continue;
+            }
+            $item = $raw;
+            if (array_key_exists('quantity', $item) || array_key_exists('qty', $item)) {
+                $q = $item['quantity'] ?? $item['qty'];
+                unset($item['qty']);
+                if ($q === '' || $q === null) {
+                    unset($item['quantity']);
+                } else {
+                    $item['quantity'] = $q;
+                }
+            }
+            // Samakan alias reason/issueDescription (satu makna, dua nama key).
+            if (array_key_exists('reason', $item) || array_key_exists('issueDescription', $item)) {
+                $reason = $item['reason'] ?? $item['issueDescription'];
+                unset($item['issueDescription']);
+                if ($reason === '' || $reason === null) {
+                    unset($item['reason']);
+                } else {
+                    $item['reason'] = is_string($reason) ? trim($reason) : $reason;
+                }
+            }
+            $norm = [];
+            ksort($item);
+            foreach ($item as $k => $v) {
+                if ($v === '' || $v === null) {
+                    continue;
+                }
+                $norm[$k] = is_numeric($v) && ! is_string($v) ? (string) $v : $v;
+            }
+            $out[] = $norm;
+        }
+        usort($out, fn ($a, $b) => strcmp(
+            json_encode([$a['id'] ?? null, $a['itemCode1'] ?? null, $a['itemName1'] ?? null, $a['itemCode2'] ?? null, $a['itemName2'] ?? null]),
+            json_encode([$b['id'] ?? null, $b['itemCode1'] ?? null, $b['itemName1'] ?? null, $b['itemCode2'] ?? null, $b['itemName2'] ?? null]),
+        ));
+
+        return $out;
     }
 
     /**

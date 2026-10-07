@@ -7,13 +7,17 @@ use App\Models\EmployeeProfile;
 use App\Models\Role;
 use App\Models\User;
 use App\Models\UserRole;
+use App\Services\AuthServiceClient;
 use App\Services\PhoneNumber;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\Rule;
 
 class IdentityRoleController extends Controller
 {
+    public function __construct(protected AuthServiceClient $idp) {}
     // ==================== WEB ADMIN ====================
 
     /**
@@ -175,7 +179,16 @@ class IdentityRoleController extends Controller
 
         $perPage = min(max((int) $request->integer('per_page', 20), 1), 200);
 
-        return response()->json($query->paginate($perPage)->appends($request->all()));
+        $paginator = $query->paginate($perPage)->appends($request->all());
+
+        // Tandai kepemilikan password dari IdP (cached, gagal-aman → null).
+        $paginator->getCollection()->transform(function (EmployeeProfile $profile) {
+            $profile->setAttribute('has_password', $this->resolveHasPassword($profile->user));
+
+            return $profile;
+        });
+
+        return response()->json($paginator);
     }
 
     public function showEmployeeProfile($id)
@@ -203,8 +216,15 @@ class IdentityRoleController extends Controller
             ? strtolower(trim($validated['email']))
             : null;
 
-        $profile = DB::transaction(function () use ($request, $validated, $phone, $email) {
-            $user = $this->resolveUserForStore($validated, $email, $phone);
+        // Identity provider dulu: user baru harus ada di Auth Service
+        // sebelum profil lokal dibuat (uuid ditautkan di bawah).
+        $idpUuid = null;
+        if (empty($validated['user_id']) && ($email || $phone)) {
+            $idpUuid = $this->provisionIdpUuid($validated['full_name'], $email, $phone);
+        }
+
+        $profile = DB::transaction(function () use ($request, $validated, $phone, $email, $idpUuid) {
+            $user = $this->resolveUserForStore($validated, $email, $phone, $idpUuid);
 
             $profile = EmployeeProfile::create([
                 'user_id' => $user->id,
@@ -263,7 +283,39 @@ class IdentityRoleController extends Controller
             }
         }
 
-        DB::transaction(function () use ($request, $profile, $validated, $phone) {
+        // Sinkron ke Auth Service dulu: lokal hanya diubah bila IdP sukses.
+        $user = $profile->user;
+        $idpUuid = $user?->auth_service_uuid;
+        if ($user && ! $idpUuid && ($user->email || $user->phone_number)) {
+            $idpUuid = $this->provisionIdpUuid($user->full_name, $user->email, $user->phone_number);
+        }
+
+        $idpFields = [];
+        if (array_key_exists('full_name', $validated)) {
+            $idpFields['full_name'] = $validated['full_name'];
+        }
+        if (array_key_exists('email', $validated)) {
+            $idpFields['email'] = $validated['email'] ? strtolower(trim($validated['email'])) : null;
+        }
+        if ($phone) {
+            $idpFields['phone_number'] = $phone;
+        }
+
+        if ($user && $idpUuid && $idpFields !== []) {
+            $synced = $this->idp->updateIdpUser($idpUuid, $idpFields);
+            if (! $synced['success']) {
+                Log::warning('IdP user update failed, local data untouched', [
+                    'uuid' => $idpUuid,
+                    'error' => $synced['error'] ?? null,
+                ]);
+
+                return response()->json([
+                    'message' => 'Gagal mengubah data di Auth Service: '.($synced['error'] ?? 'unknown error').' Data lokal tidak diubah.',
+                ], 502);
+            }
+        }
+
+        DB::transaction(function () use ($request, $profile, $validated, $phone, $idpUuid) {
             $profileFields = [];
             foreach (['employee_number', 'department_id', 'position_id', 'status'] as $field) {
                 if (array_key_exists($field, $validated)) {
@@ -277,6 +329,9 @@ class IdentityRoleController extends Controller
             $user = $profile->user;
             if ($user) {
                 $userUpdates = [];
+                if ($idpUuid && ! $user->auth_service_uuid) {
+                    $userUpdates['auth_service_uuid'] = $idpUuid;
+                }
                 if (array_key_exists('full_name', $validated)) {
                     $userUpdates['full_name'] = $validated['full_name'];
                 }
@@ -318,16 +373,97 @@ class IdentityRoleController extends Controller
     }
 
     /**
-     * @param  array<string, mixed>  $validated
+     * Kepemilikan password dari Auth Service (cached 5 menit).
+     * Mengembalikan null bila user belum tertaut atau IdP tak terjangkau.
      */
-    private function resolveUserForStore(array $validated, ?string $email, ?string $phone): User
+    protected function resolveHasPassword(?User $user): ?bool
+    {
+        $uuid = $user?->auth_service_uuid;
+        if (! $uuid) {
+            return null;
+        }
+
+        return Cache::remember("idp_has_password_{$uuid}", 300, function () use ($user) {
+            $lookup = $this->idp->findUserByPhoneOrEmail($user->phone_number, $user->email);
+
+            if (! ($lookup['success'] ?? false)) {
+                return null;
+            }
+
+            return isset($lookup['user']['has_password'])
+                ? (bool) $lookup['user']['has_password']
+                : null;
+        });
+    }
+
+    /**
+     * Lookup-or-create user di Auth Service, kembalikan uuid-nya.
+     *
+     * Lookup dulu agar tidak duplikat; kalau belum ada, provision. Retry
+     * yang aman: user IdP yatim (lokal gagal setelah IdP sukses) akan
+     * ditemukan lookup dan ditautkan, bukan diduplikat.
+     */
+    protected function provisionIdpUuid(string $fullName, ?string $email, ?string $phone): string
+    {
+        $lookup = $this->idp->findUserByPhoneOrEmail($phone, $email);
+
+        if ($lookup['success']) {
+            $uuid = $lookup['user']['uuid'] ?? $lookup['user']['id'] ?? null;
+            if (is_string($uuid) && $uuid !== '') {
+                return $uuid;
+            }
+        } elseif (($lookup['error'] ?? null) !== 'not_found') {
+            Log::warning('IdP user lookup failed during provisioning', ['error' => $lookup['error'] ?? null]);
+            abort(response()->json([
+                'message' => 'Auth Service tidak dapat dihubungi. Data lokal tidak diubah.',
+            ], 502));
+        }
+
+        $created = $this->idp->createIdpUser(array_filter([
+            'full_name' => $fullName,
+            'email' => $email,
+            'phone_number' => $phone,
+        ], fn ($value) => $value !== null && $value !== ''));
+
+        if ($created['success'] && ! empty($created['uuid'])) {
+            return (string) $created['uuid'];
+        }
+
+        // Balapan: identifier dibuat pihak lain di antara lookup dan create.
+        if (($created['status'] ?? null) === 409 && ! empty($created['duplicate_user']['uuid'])) {
+            return (string) $created['duplicate_user']['uuid'];
+        }
+
+        Log::warning('IdP user provisioning failed', ['error' => $created['error'] ?? null]);
+        abort(response()->json([
+            'message' => 'Gagal membuat user di Auth Service: '.($created['error'] ?? 'unknown error').' Data lokal tidak diubah.',
+        ], 502));
+    }
+
+    private function resolveUserForStore(array $validated, ?string $email, ?string $phone, ?string $idpUuid = null): User
     {
         if (! empty($validated['user_id'])) {
-            return User::findOrFail($validated['user_id']);
+            $user = User::findOrFail($validated['user_id']);
+
+            // Tautkan uuid IdP untuk user lama yang belum tertaut.
+            if (! $user->auth_service_uuid && ($user->email || $user->phone_number)) {
+                $user->update([
+                    'auth_service_uuid' => $this->provisionIdpUuid(
+                        $user->full_name,
+                        $user->email,
+                        $user->phone_number
+                    ),
+                ]);
+            }
+
+            return $user->refresh();
         }
 
         $user = null;
-        if ($email) {
+        if ($idpUuid) {
+            $user = User::where('auth_service_uuid', $idpUuid)->first();
+        }
+        if (! $user && $email) {
             $user = User::where('email', $email)->first();
         }
         if (! $user && $phone) {
@@ -343,6 +479,7 @@ class IdentityRoleController extends Controller
             }
 
             $user->update(array_filter([
+                'auth_service_uuid' => $idpUuid ?? $user->auth_service_uuid,
                 'full_name' => $validated['full_name'] ?? null,
                 'email' => $email,
                 'phone_number' => $phone,
@@ -352,6 +489,7 @@ class IdentityRoleController extends Controller
         }
 
         return User::create([
+            'auth_service_uuid' => $idpUuid,
             'full_name' => $validated['full_name'],
             'email' => $email,
             'phone_number' => $phone,

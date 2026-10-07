@@ -1,12 +1,14 @@
 <?php
 
-use App\Http\Controllers\Admin\IdentityRoleController;
 use App\Http\Controllers\Admin\CustomerController;
+use App\Http\Controllers\Admin\DashboardSummaryController;
+use App\Http\Controllers\Admin\IdentityRoleController;
 use App\Http\Controllers\Admin\PasswordLinkController;
 use App\Http\Controllers\ApprovalController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\HandlerController;
 use App\Http\Controllers\MasterDataController;
+use App\Http\Controllers\ReviewerController;
 use App\Http\Controllers\SapController;
 use App\Http\Controllers\TicketController;
 use App\Http\Controllers\TicketInteractionController;
@@ -30,8 +32,8 @@ Route::prefix('auth')->group(function () {
         Route::get('identity-status', [AuthController::class, 'identityStatus']);
         Route::post('logout', [AuthController::class, 'logout']);
 
-        // Ticket endpoints
-        Route::apiResource('tickets', TicketController::class);
+        // Ticket endpoints (tiket tidak boleh dihapus — tanpa `destroy`)
+        Route::apiResource('tickets', TicketController::class)->except(['destroy']);
         Route::post('tickets/{id}/review', [TicketController::class, 'submitReview']);
 
         // Percakapan (obrolan) tiket
@@ -39,9 +41,13 @@ Route::prefix('auth')->group(function () {
         Route::post('tickets/{id}/interactions', [TicketInteractionController::class, 'store']);
         Route::delete('tickets/{id}/interactions/{interaction}', [TicketInteractionController::class, 'destroy']);
 
-        // Approval endpoints — approver adalah posisi, bukan role
+        // Approval endpoints - approver adalah posisi, bukan role
         Route::get('approvals', [ApprovalController::class, 'index']);
         Route::post('approvals/{id}/decide', [ApprovalController::class, 'decide']);
+        Route::get('approver/summary', [ApprovalController::class, 'summary']);
+
+        // Reviewer - ringkasan dasbor (satu request untuk KPI + antrean)
+        Route::get('reviewer/summary', [ReviewerController::class, 'summary']);
 
         // Unit Teknis — departemen penerima tiket setelah approval awal
         Route::get('unit/tickets', [UnitController::class, 'queue']);
@@ -51,17 +57,21 @@ Route::prefix('auth')->group(function () {
 
         // Handler — pegawai yang mengerjakan tiket (assignment dari unit)
         Route::get('handler/tickets', [HandlerController::class, 'index']);
+        Route::get('handler/summary', [HandlerController::class, 'summary']);
         Route::get('handler/tickets/{id}', [HandlerController::class, 'show']);
         Route::post('handler/tickets/{id}/progress', [HandlerController::class, 'storeProgress']);
         Route::post('handler/tickets/{id}/resolution', [HandlerController::class, 'submitResolution']);
 
         // SAP integration
         Route::get('sap/items', [SapController::class, 'searchItems']);
+        Route::get('sap/order/detail', [SapController::class, 'getOrderDetail']);
+        Route::get('sap/order/monitor-list', [SapController::class, 'getSoMonitorList']);
+        Route::get('sap/item-groups', [SapController::class, 'itemGroups']);
     });
 });
 
 // Admin endpoints for BRTHub app admin (using client credentials via AuthServiceClient)
-Route::middleware('auth.authservice')->prefix('admin')->group(function () {
+Route::middleware(['auth.authservice', 'roles:admin'])->prefix('admin')->group(function () {
     Route::post('users/{userId}/setup-password-link', [PasswordLinkController::class, 'createSetupLink']);
     Route::post('users/{userId}/reset-password-link', [PasswordLinkController::class, 'createResetLink']);
 
@@ -75,6 +85,9 @@ Route::middleware('auth.authservice')->prefix('admin')->group(function () {
     Route::put('employee-profiles/{id}', [IdentityRoleController::class, 'updateEmployeeProfile']);
     Route::delete('employee-profiles/{id}', [IdentityRoleController::class, 'destroyEmployeeProfile']);
     Route::get('customers', [CustomerController::class, 'index']);
+
+    // Ringkasan dasbor admin (KPI, funnel, workload, tren, tiket OPEN terlama)
+    Route::get('dashboard-summary', [DashboardSummaryController::class, 'index']);
 });
 
 // Master data endpoints (public access for dropdowns)
@@ -83,15 +96,22 @@ Route::prefix('master')->group(function () {
     Route::get('employees', [MasterDataController::class, 'employees']);
     Route::get('positions', [MasterDataController::class, 'positions']);
     Route::get('categories', [MasterDataController::class, 'categories']);
-    Route::get('products', [MasterDataController::class, 'products']);
     Route::get('priorities', [MasterDataController::class, 'priorities']);
     Route::get('ticket-types', [MasterDataController::class, 'ticketTypes']);
     Route::get('statuses', [MasterDataController::class, 'statuses']);
     Route::get('all', [MasterDataController::class, 'all']);
 });
 
-// Admin master data CRUD (protected)
-Route::middleware('auth.authservice')->prefix('admin')->group(function () {
+// Admin master data CRUD (protected, admin only)
+Route::middleware(['auth.authservice', 'roles:admin'])->prefix('admin')->group(function () {
+    // Matriks kategori → aksi (pivot ber-PK komposit, tidak cocok pola {type}/{id}).
+    // Didaftarkan SEBELUM route generik: `POST master/category-actions` akan
+    // ditangkap `POST master/{type}` bila urutannya dibalik.
+    Route::get('master/category-actions', [MasterDataController::class, 'categoryActions']);
+    Route::post('master/category-actions', [MasterDataController::class, 'attachCategoryAction']);
+    Route::put('master/category-actions/{category}/{action}', [MasterDataController::class, 'updateCategoryAction']);
+    Route::delete('master/category-actions/{category}/{action}', [MasterDataController::class, 'detachCategoryAction']);
+
     Route::post('master/{type}', [MasterDataController::class, 'store']);
     Route::put('master/{type}/{id}', [MasterDataController::class, 'update']);
     Route::delete('master/{type}/{id}', [MasterDataController::class, 'destroy']);

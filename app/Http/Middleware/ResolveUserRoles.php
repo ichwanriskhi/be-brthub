@@ -2,9 +2,7 @@
 
 namespace App\Http\Middleware;
 
-use App\Models\PositionRoleMapping;
 use App\Models\UserRole;
-use App\Services\AuthServiceClient;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -51,40 +49,10 @@ class ResolveUserRoles
             ]);
         }
 
-        // 3. Fallback: jika karyawan TAPI belum ada role manual
+        // 3. Fallback: tanpa role manual, user dianggap reporter.
+        // (Assign role sepenuhnya manual via user_roles oleh admin.)
         if (empty($roles)) {
-            $email = $user->email ?? null;
-
-            // Coba ambil dari Auth Service /api/auth/me
-            if ($email && config('auth_service.token')) {
-                try {
-                    $client = new AuthServiceClient;
-                    $result = $client->getUser(config('auth_service.token'));
-
-                    if ($result['success'] && isset($result['data']['employee'])) {
-                        $emp = $result['data']['employee'];
-
-                        // Cek position_role_mappings
-                        $mappedRoles = PositionRoleMapping::where('position_id', $emp['position_id'])
-                            ->where('is_default', true)
-                            ->with('role:name')
-                            ->get()
-                            ->pluck('role.name')
-                            ->toArray();
-
-                        $roles = $mappedRoles;
-                    }
-                } catch (\Throwable $e) {
-                    Log::warning('AuthService fallback failed, using default role', [
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
-
-            // Default non-staff → reporter
-            if (empty($roles)) {
-                $roles = ['reporter'];
-            }
+            $roles = ['reporter'];
         }
 
         // 4. Cache ke session & inject ke request

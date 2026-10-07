@@ -92,6 +92,15 @@ class Ticket extends Model
     }
 
     /**
+     * Timeline kronologis tiket dari pembuatan sampai selesai
+     * (ditulis eksplisit via TicketActivityLogger di setiap aksi workflow).
+     */
+    public function activities(): HasMany
+    {
+        return $this->hasMany(TicketActivity::class, 'ticket_id')->orderBy('created_at');
+    }
+
+    /**
      * Jejak alur tiket:
      *  INITIAL          — routing reviewer (ROUTE / REQUEST_REWORK / REJECT)
      *  APPROVAL_INITIAL — keputusan approver untuk persetujuan awal
@@ -135,6 +144,26 @@ class Ticket extends Model
     {
         return $this->hasMany(TicketResolution::class, 'ticket_id')
             ->orderByDesc('resolution_no');
+    }
+
+    /**
+     * Jejak pengiriman klaim ke WANSIS.
+     *
+     * Dibuat hanya untuk kategori `KLAIM_DISTRIBUSI*` (lihat
+     * ApprovalController::sendClaimToWansis). Kolom `wansis_*` yang dulu ada di
+     * tabel `tickets` sudah dipindah ke sini (migrasi 2026_09_30), jadi
+     * `tickets` tetap bersih.
+     *
+     * `hasMany` bukan `hasOne`: tidak ada unique constraint di `ticket_id` dan
+     * kolom `attempt` menyiratkan retry bisa menambah baris. Konsumen yang
+     * butuh nomor report harus mengambil baris TERAKHIR yang punya
+     * `wansis_report_id` terisi — baris berstatus `queued`/`failed` belum punya
+     * nomor sama sekali.
+     */
+    public function wansisReports(): HasMany
+    {
+        return $this->hasMany(WansisReport::class, 'ticket_id')
+            ->orderByDesc('id');
     }
 
     public function latestResolution(): HasOne

@@ -45,6 +45,6 @@ return [
         'url' => env('SAP_API_URL', 'http://192.168.11.228:3000'),
         'timeout' => env('SAP_API_TIMEOUT', 30),
         'cache_ttl' => env('SAP_API_CACHE_TTL', 3600),
+        'item_groups_path' => env('SAP_API_ITEM_GROUPS_PATH', '/api/sap/filters/itemgroupslist'),
     ],
 ];
-

@@ -2,15 +2,17 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Action;
 use App\Models\Category;
+use App\Models\CategoryAction;
 use App\Models\Department;
 use App\Models\EmployeeProfile;
 use App\Models\Position;
 use App\Models\PriorityLevel;
-use App\Models\Product;
 use App\Models\TicketStatus;
 use App\Models\TicketType;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -62,18 +64,6 @@ class MasterDataController extends Controller
             ->get(['id', 'code', 'name']);
 
         return response()->json($categories);
-    }
-
-    /**
-     * Get all products (lini produk) for dropdown
-     */
-    public function products()
-    {
-        $products = Product::where('is_active', true)
-            ->orderBy('name')
-            ->get(['id', 'code', 'name']);
-
-        return response()->json($products);
     }
 
     /**
@@ -150,28 +140,122 @@ class MasterDataController extends Controller
                 ->orderBy('name')
                 ->get($categoryColumns),
 
-            'products' => Product::query()
+            'priorities' => PriorityLevel::query()
                 ->when(! $withInactive, fn ($q) => $q->where('is_active', true))
-                ->orderBy('name')
-                ->get(['id', 'code', 'name', 'description', 'is_active']),
-
-            'priorities' => PriorityLevel::where('is_active', true)
                 ->orderBy('sort_order')
-                ->get(['id', 'code', 'name']),
+                ->get(['id', 'code', 'name', 'sort_order', 'is_active']),
 
-            'ticketTypes' => TicketType::where('is_active', true)
+            'ticketTypes' => TicketType::query()
+                ->when(! $withInactive, fn ($q) => $q->where('is_active', true))
                 ->orderBy('id')
-                ->get(['id', 'code', 'name']),
+                ->get(['id', 'code', 'name', 'is_active']),
 
             'statuses' => TicketStatus::orderBy('sort_order')
                 ->get(['id', 'code', 'name', 'is_terminal']),
 
-            'actions' => \App\Models\Action::where('is_active', true)
-                ->get(['id', 'code', 'name', 'description']),
+            'actions' => Action::query()
+                ->when(! $withInactive, fn ($q) => $q->where('is_active', true))
+                ->orderBy('name')
+                ->get(['id', 'code', 'name', 'description', 'is_active']),
 
-            'category_actions' => \App\Models\CategoryAction::with('action')
+            'category_actions' => CategoryAction::with('action')
                 ->get(['category_id', 'action_id', 'is_recommended']),
         ]);
+    }
+
+    /**
+     * Daftar mapping kategori → aksi untuk editor matriks admin.
+     * GET /api/admin/master/category-actions?category_id=
+     */
+    public function categoryActions(Request $request)
+    {
+        $request->validate([
+            'category_id' => 'nullable|integer|exists:categories,id',
+        ]);
+
+        $query = CategoryAction::with('action:id,code,name,description,is_active')
+            ->orderBy('category_id')
+            ->orderBy('action_id');
+
+        if ($request->filled('category_id')) {
+            $query->where('category_id', $request->integer('category_id'));
+        }
+
+        return response()->json($query->get());
+    }
+
+    /**
+     * Pasang aksi ke kategori.
+     * POST /api/admin/master/category-actions
+     */
+    public function attachCategoryAction(Request $request)
+    {
+        $validated = $request->validate([
+            'category_id' => 'required|integer|exists:categories,id',
+            'action_id' => [
+                'required',
+                'integer',
+                'exists:actions,id',
+                Rule::unique('category_actions', 'action_id')->where(
+                    fn ($q) => $q->where('category_id', $request->input('category_id'))
+                ),
+            ],
+            'is_recommended' => 'boolean',
+        ]);
+
+        $mapping = CategoryAction::create([
+            'category_id' => $validated['category_id'],
+            'action_id' => $validated['action_id'],
+            'is_recommended' => $validated['is_recommended'] ?? false,
+        ]);
+
+        return response()->json($mapping->load('action:id,code,name'), 201);
+    }
+
+    /**
+     * Ubah flag rekomendasi satu mapping.
+     * PUT /api/admin/master/category-actions/{category}/{action}
+     */
+    public function updateCategoryAction(Request $request, string $category, string $action)
+    {
+        // Pivot ber-PK komposit tanpa kolom `id` — `$mapping->update()` akan
+        // menghasilkan `where id is null`. Update lewat query builder.
+        $exists = CategoryAction::where('category_id', $category)
+            ->where('action_id', $action)
+            ->exists();
+
+        abort_unless($exists, 404);
+
+        $validated = $request->validate([
+            'is_recommended' => 'required|boolean',
+        ]);
+
+        CategoryAction::where('category_id', $category)
+            ->where('action_id', $action)
+            ->update(['is_recommended' => $validated['is_recommended']]);
+
+        $mapping = CategoryAction::where('category_id', $category)
+            ->where('action_id', $action)
+            ->with('action:id,code,name')
+            ->firstOrFail();
+
+        return response()->json($mapping);
+    }
+
+    /**
+     * Lepas aksi dari kategori (aksi master-nya tidak ikut terhapus).
+     * DELETE /api/admin/master/category-actions/{category}/{action}
+     */
+    public function detachCategoryAction(string $category, string $action)
+    {
+        // Sama seperti update: tanpa kolom `id`, hapus lewat query builder.
+        $deleted = CategoryAction::where('category_id', $category)
+            ->where('action_id', $action)
+            ->delete();
+
+        abort_unless($deleted, 404);
+
+        return response()->json(null, 204);
     }
 
     /**
@@ -237,6 +321,17 @@ class MasterDataController extends Controller
     public function update(Request $request, string $type, string $id)
     {
         $model = $this->getModelClass($type)::findOrFail($id);
+
+        // `code` action adalah identitas yang dipakai reviewer (`resolveActionId`
+        // menerima code) — mengubahnya diam-diam akan mengaburkan jejak tiket
+        // lama. Tolak eksplisit, bukan diabaikan. Sama untuk prioritas & tipe:
+        // code-nya dipakai sebagai key filter, badge, dan resolve di banyak tempat.
+        if (in_array($type, ['action', 'priority', 'ticket_type']) && $request->exists('code') && $request->input('code') !== $model->code) {
+            throw ValidationException::withMessages([
+                'code' => ['Kode tidak dapat diubah setelah dibuat.'],
+            ]);
+        }
+
         $this->normalizeMasterPayload($request);
         $validated = $this->validateMasterData($request, $type, false, $id);
         $model->update($validated);
@@ -253,16 +348,56 @@ class MasterDataController extends Controller
         $model = $this->getModelClass($type)::findOrFail($id);
 
         // Prevent deletion if referenced by tickets
-        if (in_array($type, ['category', 'product'])) {
-            $relation = $type === 'category' ? 'tickets' : 'tickets';
-            if ($model->$relation()->exists()) {
+        if ($type === 'category') {
+            if ($model->tickets()->exists()) {
                 return response()->json([
-                    'message' => "{$type} sedang digunakan oleh tiket dan tidak dapat dihapus."
+                    'message' => 'Kategori sedang digunakan oleh tiket dan tidak dapat dihapus.',
+                ], 409);
+            }
+        }
+
+        if ($type === 'action') {
+            $ticketCount = DB::table('tickets')
+                ->where('action_id', $model->id)
+                ->count();
+            if ($ticketCount > 0) {
+                return response()->json([
+                    'message' => "Aksi ini sudah dipilih pada {$ticketCount} tiket dan tidak dapat dihapus.",
+                ], 409);
+            }
+
+            $mappingCount = CategoryAction::where('action_id', $model->id)->count();
+            if ($mappingCount > 0) {
+                return response()->json([
+                    'message' => "Aksi ini masih terpasang pada {$mappingCount} kategori. Lepaskan dulu sebelum menghapus.",
+                ], 409);
+            }
+        }
+
+        if ($type === 'priority') {
+            $ticketCount = DB::table('tickets')
+                ->where('priority_id', $model->id)
+                ->count();
+            if ($ticketCount > 0) {
+                return response()->json([
+                    'message' => "Prioritas ini dipakai {$ticketCount} tiket dan tidak dapat dihapus.",
+                ], 409);
+            }
+        }
+
+        if ($type === 'ticket_type') {
+            $ticketCount = DB::table('tickets')
+                ->where('ticket_type_id', $model->id)
+                ->count();
+            if ($ticketCount > 0) {
+                return response()->json([
+                    'message' => "Tipe ini dipakai {$ticketCount} tiket dan tidak dapat dihapus.",
                 ], 409);
             }
         }
 
         $model->delete();
+
         return response()->json(null, 204);
     }
 
@@ -275,7 +410,9 @@ class MasterDataController extends Controller
             'category' => Category::class,
             'department' => Department::class,
             'position' => Position::class,
-            'product' => Product::class,
+            'action' => Action::class,
+            'priority' => PriorityLevel::class,
+            'ticket_type' => TicketType::class,
             default => abort(400, 'Tipe master data tidak valid.'),
         };
     }
@@ -338,10 +475,21 @@ class MasterDataController extends Controller
                 'hierarchy_level' => 'required|integer|min:0',
                 'is_active' => 'boolean',
             ],
-            'product' => [
+            'action' => [
                 'name' => 'required|string|max:255',
-                'code' => ['required', 'string', 'max:50', Rule::unique('products', 'code')->ignore($ignore)],
+                'code' => ['required', 'string', 'max:50', Rule::unique('actions', 'code')->ignore($ignore)],
                 'description' => 'nullable|string',
+                'is_active' => 'boolean',
+            ],
+            'priority' => [
+                'name' => 'required|string|max:255',
+                'code' => ['required', 'string', 'max:10', Rule::unique('priority_levels', 'code')->ignore($ignore)],
+                'sort_order' => 'nullable|integer|min:0',
+                'is_active' => 'boolean',
+            ],
+            'ticket_type' => [
+                'name' => 'required|string|max:255',
+                'code' => ['required', 'string', 'max:50', Rule::unique('ticket_types', 'code')->ignore($ignore)],
                 'is_active' => 'boolean',
             ],
             default => abort(400, 'Tipe master data tidak valid.'),

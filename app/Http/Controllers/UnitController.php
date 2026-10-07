@@ -4,7 +4,8 @@ namespace App\Http\Controllers;
 
 use App\Models\EmployeeProfile;
 use App\Models\Ticket;
-use App\Models\TicketAssignment;
+use App\Models\TicketActivity;
+use App\Services\TicketActivityLogger;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -95,11 +96,14 @@ class UnitController extends Controller
             'salesDetail',
             'action',
             'latestRevision',
-                'destinationDepartment',
+            'destinationDepartment',
             'attachments',
             'assignments.assignedToEmployee.user',
             'assignments.assignedByEmployee.user',
             'latestReviewLog.destinationDepartment',
+            'activities.actor:id,full_name',
+            // Nomor report WANSIS (hanya untuk klaim distribusi).
+            'wansisReports:id,ticket_id,wansis_report_id',
         ]);
 
         return response()->json($ticket);
@@ -226,6 +230,15 @@ class UnitController extends Controller
             'assigned_at' => now(),
             'is_active' => true,
         ]);
+
+        TicketActivityLogger::record(
+            $ticket,
+            TicketActivity::TYPE_HANDLER_ASSIGNED,
+            $request->user()?->id,
+            "Handler ditugaskan: {$handler->user?->full_name}.",
+            ['status' => 'IN_PROGRESS'],
+            ['status' => 'IN_PROGRESS'],
+        );
 
         return response()->json([
             'success' => true,

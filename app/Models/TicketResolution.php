@@ -61,9 +61,16 @@ class TicketResolution extends Model
 
     /**
      * Log review yang memproses resolusi ini (catatan reviewer/approver).
+     *
+     * Satu resolusi punya DUA baris review_logs: SUBMIT (jejak pengajuan
+     * handler, notes = ringkasan handler) dan APPROVAL (keputusan approver,
+     * notes = alasan penolakan, hanya saat REJECT). `latestOfMany` mengambil
+     * baris terbaru = log APPROVAL bila sudah diputus. Tanpa ini, HasOne
+     * polos mengembalikan baris SUBMIT sehingga teks handler terbaca sebagai
+     * "catatan approver" di FE.
      */
     public function reviewLog(): HasOne
     {
-        return $this->hasOne(ReviewLog::class, 'resolution_id');
+        return $this->hasOne(ReviewLog::class, 'resolution_id')->latestOfMany();
     }
 }

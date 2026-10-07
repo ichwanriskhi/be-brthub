@@ -62,6 +62,8 @@ class AuthServiceClient
 
     /**
      * Request OTP (auto-detect email vs phone).
+     * Selalu menyertakan app_id agar Auth Service dapat memvalidasi client
+     * dan mengikat sesi ke aplikasi yang benar.
      */
     public function requestOtpAuto(string $identifier, string $action): array
     {
@@ -69,11 +71,13 @@ class AuthServiceClient
             $response = Http::post("{$this->baseUrl}/api/auth/email-otp/request", [
                 'action' => $action,
                 'email' => strtolower(trim($identifier)),
+                'app_id' => $this->clientId,
             ]);
         } else {
             $response = Http::post("{$this->baseUrl}/api/auth/otp/request", [
                 'action' => $action,
                 'phone_number' => $this->normalizePhone($identifier),
+                'app_id' => $this->clientId,
             ]);
         }
 
@@ -89,6 +93,7 @@ class AuthServiceClient
 
     /**
      * Verify OTP (auto-detect email vs phone).
+     * Selalu menyertakan app_id agar sesi di Auth Service terikat ke BRTHub.
      */
     public function verifyOtpAuto(string $identifier, string $code, string $action): array
     {
@@ -97,12 +102,14 @@ class AuthServiceClient
                 'action' => $action,
                 'email' => strtolower(trim($identifier)),
                 'otp' => $code,
+                'app_id' => $this->clientId,
             ]);
         } else {
             $response = Http::post("{$this->baseUrl}/api/auth/otp/verify", [
                 'action' => $action,
                 'phone_number' => $this->normalizePhone($identifier),
                 'otp' => $code,
+                'app_id' => $this->clientId,
             ]);
         }
 
@@ -166,7 +173,7 @@ class AuthServiceClient
 
         $response = Http::withToken($token)
             ->timeout(30)
-            ->get("{$this->baseUrl}/api/v1/admin/users", $query);
+            ->get("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users", $query);
 
         if ($response->status() === 404) {
             return ['success' => false, 'error' => 'not_found'];
@@ -174,6 +181,73 @@ class AuthServiceClient
 
         if (! $response->successful()) {
             return ['success' => false, 'error' => $response->json('message', 'User lookup failed')];
+        }
+
+        return ['success' => true, 'user' => $response->json('data', [])];
+    }
+
+    /**
+     * Provision a new IdP user (admin endpoint). Returns the IdP uuid on success.
+     *
+     * @param  array{full_name: string, email?: ?string, phone_number?: ?string}  $attributes
+     * @return array{success: bool, uuid?: string, user?: array<string, mixed>, status?: int, error?: string, duplicate_user?: array<string, mixed>}
+     */
+    public function createIdpUser(array $attributes): array
+    {
+        $token = $this->getClientCredentialsToken();
+        if (! $token) {
+            return ['success' => false, 'error' => 'Failed to get client credentials token'];
+        }
+
+        $response = Http::withToken($token)
+            ->timeout(30)
+            ->post("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users", $attributes);
+
+        if ($response->status() === 409) {
+            return [
+                'success' => false,
+                'status' => 409,
+                'error' => 'already_exists',
+                'duplicate_user' => $response->json('data.user', []),
+            ];
+        }
+
+        if (! $response->successful()) {
+            return [
+                'success' => false,
+                'status' => $response->status(),
+                'error' => $response->json('message', 'Failed to create IdP user'),
+            ];
+        }
+
+        $user = $response->json('data', []);
+
+        return ['success' => true, 'uuid' => $user['uuid'] ?? $user['id'] ?? null, 'user' => $user];
+    }
+
+    /**
+     * Update IdP user data by uuid (admin endpoint).
+     *
+     * @param  array<string, mixed>  $attributes
+     * @return array{success: bool, user?: array<string, mixed>, status?: int, error?: string}
+     */
+    public function updateIdpUser(string $uuid, array $attributes): array
+    {
+        $token = $this->getClientCredentialsToken();
+        if (! $token) {
+            return ['success' => false, 'error' => 'Failed to get client credentials token'];
+        }
+
+        $response = Http::withToken($token)
+            ->timeout(30)
+            ->patch("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users/{$uuid}", $attributes);
+
+        if (! $response->successful()) {
+            return [
+                'success' => false,
+                'status' => $response->status(),
+                'error' => $response->json('message', 'Failed to update IdP user'),
+            ];
         }
 
         return ['success' => true, 'user' => $response->json('data', [])];
@@ -211,7 +285,7 @@ class AuthServiceClient
         $cacheKey = "auth_service_client_token_{$this->clientId}";
 
         return Cache::remember($cacheKey, 55, function () {
-            $response = Http::asForm()->post("{$this->baseUrl}/oauth/token", [
+            $response = Http::asForm()->post("{$this->baseUrl}/api/oauth/token", [
                 'grant_type' => 'client_credentials',
                 'client_id' => $this->clientId,
                 'client_secret' => $this->clientSecret,
@@ -234,7 +308,7 @@ class AuthServiceClient
     /**
      * Setup password link for user (admin endpoint).
      */
-    public function createSetupPasswordLink(string $userId): array
+    public function createSetupPasswordLink(string $userId, ?string $channel = null): array
     {
         $token = $this->getClientCredentialsToken();
         if (! $token) {
@@ -243,18 +317,23 @@ class AuthServiceClient
 
         $response = Http::withToken($token)
             ->timeout(30)
-            ->post("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users/{$userId}/setup-password-link");
+            ->post("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users/{$userId}/setup-password-link",
+                $channel ? ['channel' => $channel] : []);
 
-        return $response->json([
-            'success' => false,
-            'error' => 'Failed to create setup password link',
-        ]);
+        if (! $response->successful()) {
+            return [
+                'success' => false,
+                'error' => $response->json('message', 'Failed to create setup password link'),
+            ];
+        }
+
+        return $response->json();
     }
 
     /**
      * Reset password link for user (admin endpoint).
      */
-    public function createResetPasswordLink(string $userId): array
+    public function createResetPasswordLink(string $userId, ?string $channel = null): array
     {
         $token = $this->getClientCredentialsToken();
         if (! $token) {
@@ -263,16 +342,26 @@ class AuthServiceClient
 
         $response = Http::withToken($token)
             ->timeout(30)
-            ->post("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users/{$userId}/reset-password-link");
+            ->post("{$this->baseUrl}/api/v1/admin/apps/{$this->clientId}/users/{$userId}/reset-password-link",
+                $channel ? ['channel' => $channel] : []);
 
-        return $response->json([
-            'success' => false,
-            'error' => 'Failed to create reset password link',
-        ]);
+        if (! $response->successful()) {
+            return [
+                'success' => false,
+                'error' => $response->json('message', 'Failed to create reset password link'),
+            ];
+        }
+
+        return $response->json();
     }
 
     /**
      * Refresh access token.
+     *
+     * Mengembalikan respons IdP apa adanya (kontrak: `success` + pesan).
+     * JANGAN memakai `$response->json([...])` dengan array sebagai argumen —
+     * itu dibaca sebagai `$key`, bukan default, sehingga selalu null dan
+     * meledak di return type `array` (setiap refresh = 500 = logout paksa).
      */
     public function refreshToken(string $refreshToken): array
     {
@@ -282,10 +371,16 @@ class AuthServiceClient
             'client_secret' => $this->clientSecret,
         ]);
 
-        return $response->json([
-            'success' => false,
-            'error' => 'Token refresh failed',
-        ]);
+        $data = $response->json();
+
+        if (! is_array($data)) {
+            return [
+                'success' => false,
+                'error' => 'Token refresh failed',
+            ];
+        }
+
+        return $data;
     }
 
     /**
@@ -297,9 +392,15 @@ class AuthServiceClient
             ->timeout(30)
             ->post("{$this->baseUrl}/api/auth/logout");
 
-        return $response->json([
-            'success' => false,
-            'error' => 'Logout failed',
-        ]);
+        $data = $response->json();
+
+        if (! is_array($data)) {
+            return [
+                'success' => false,
+                'error' => 'Logout failed',
+            ];
+        }
+
+        return $data;
     }
 }

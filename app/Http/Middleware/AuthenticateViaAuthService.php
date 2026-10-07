@@ -2,7 +2,6 @@
 
 namespace App\Http\Middleware;
 
-use App\Models\PositionRoleMapping;
 use App\Models\User;
 use App\Models\UserRole;
 use App\Services\UserSyncService;
@@ -91,7 +90,7 @@ class AuthenticateViaAuthService
                 $query->whereNull('expires_at')
                     ->orWhere('expires_at', '>', now());
             })
-            ->with('role:name')
+            ->with('role:id,name')
             ->get()
             ->pluck('role.name')
             ->toArray();
@@ -99,27 +98,9 @@ class AuthenticateViaAuthService
         if (! empty($manualRoles)) {
             $roles = $manualRoles;
         } else {
-            // 2. Check if user has employee profile (pegawai)
-            $employeeProfile = $user->employeeProfile;
-
-            if ($employeeProfile && $employeeProfile->position_id) {
-                // Map position to roles via PositionRoleMapping
-                $mappedRoles = PositionRoleMapping::where('position_id', $employeeProfile->position_id)
-                    ->where('is_default', true)
-                    ->with('role:name')
-                    ->get()
-                    ->pluck('role.name')
-                    ->toArray();
-
-                if (! empty($mappedRoles)) {
-                    $roles = $mappedRoles;
-                }
-            }
-
-            // 3. Default fallback: non-staff → reporter
-            if (empty($roles)) {
-                $roles = ['reporter'];
-            }
+            // Tanpa role manual, user dianggap reporter.
+            // (Assign role sepenuhnya manual via user_roles oleh admin.)
+            $roles = ['reporter'];
         }
 
         // Cache in request (no session for API routes)

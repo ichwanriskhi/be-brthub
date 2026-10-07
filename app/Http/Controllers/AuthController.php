@@ -7,6 +7,7 @@ use App\Services\PhoneNumber;
 use App\Services\UserSyncService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class AuthController extends Controller
 {
@@ -172,6 +173,10 @@ class AuthController extends Controller
 
         $result = $this->authService->revokeToken($token);
 
+        // Hapus cache introspeksi token ini: tanpa ini, token yang sudah
+        // di-revoke tetap diterima middleware s.d. 5 menit (fixed-window).
+        Cache::forget('auth_service_token_'.sha1($token));
+
         // Also revoke local session if exists
         // (implement if using local sessions)
 
@@ -216,11 +221,11 @@ class AuthController extends Controller
             // Approver adalah posisi (bukan role): FE butuh hierarchy_level
             // untuk menentukan apakah user ini berhak membuka /approver
             $brthubData = [
-                'roles'            => $localUser->getActiveRoles(),
+                'roles' => $localUser->getActiveRoles(),
                 'employee_profile' => $localUser->employeeProfile ? [
-                    'id'            => $localUser->employeeProfile->id,
+                    'id' => $localUser->employeeProfile->id,
                     'department_id' => $localUser->employeeProfile->department_id,
-                    'position_id'   => $localUser->employeeProfile->position_id,
+                    'position_id' => $localUser->employeeProfile->position_id,
                     'position_name' => $position?->name,
                     'hierarchy_level' => $position?->hierarchy_level,
                 ] : null,

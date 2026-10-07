@@ -15,9 +15,4 @@ class TicketVehicleDetail extends Model
     {
         return $this->belongsTo(Ticket::class, 'ticket_id');
     }
-
-    public function product(): BelongsTo
-    {
-        return $this->belongsTo(Product::class, 'product_id');
-    }
 }

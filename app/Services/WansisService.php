@@ -56,6 +56,58 @@ class WansisService
     }
 
     /**
+     * Daftar Item Group SAP untuk dropdown Lini Produk & mapping kode grup.
+     *
+     * Path upstream dari config (`services.sap.item_groups_path`) karena
+     * endpoint filter masih finalisasi di sisi SAP — default
+     * `/api/sap/filters/itemgroupslist` (terkonfirmasi dari response langsung),
+     * ubah via .env (`SAP_API_ITEM_GROUPS_PATH`) bila berubah tanpa deploy kode.
+     * Response: { itemGroups: [nama], itemGroupObjects: [{code, name}] }.
+     * Normalisasi ke [{code, name}]; bila hanya ada nama, code = null.
+     */
+    public function getItemGroups(): array
+    {
+        $cacheTtl = config('services.sap.cache_ttl', 3600);
+        $path = config('services.sap.item_groups_path', '/api/sap/filters/itemgroupslist');
+
+        return cache()->remember('sap_item_groups', $cacheTtl, function () use ($path) {
+            $response = Http::timeout($this->timeout)
+                ->acceptJson()
+                ->get("{$this->sapApiUrl}{$path}");
+
+            if (! $response->successful()) {
+                Log::error('Gagal mengambil SAP item groups', [
+                    'path' => $path,
+                    'status' => $response->status(),
+                ]);
+
+                return [];
+            }
+
+            $data = $response->json();
+            $objects = $data['itemGroupObjects'] ?? null;
+            if (is_array($objects)) {
+                return array_values(array_filter(array_map(
+                    fn ($o) => is_array($o) && isset($o['name'])
+                        ? ['code' => $o['code'] ?? null, 'name' => (string) $o['name']]
+                        : null,
+                    $objects
+                )));
+            }
+
+            $names = $data['itemGroups'] ?? [];
+            if (is_array($names)) {
+                return array_values(array_filter(array_map(
+                    fn ($n) => is_string($n) && $n !== '' ? ['code' => null, 'name' => $n] : null,
+                    $names
+                )));
+            }
+
+            return [];
+        });
+    }
+
+    /**
      * Cari master data item dari SAP
      */
     public function searchSapItems(string $query, int $page = 1): array
@@ -121,6 +173,66 @@ class WansisService
             }
 
             return [];
+        });
+    }
+
+    /**
+     * Ambil detail Sales Order dari SAP berdasarkan SO number.
+     *
+     * Cache 10 menit (600 detik) — data SO tidak sering berubah dan
+     * request berulang untuk SO yang sama (mis. saat membuka klaim)
+     * tidak perlu memukul SAP setiap kali.
+     */
+    public function getOrderDetail(string $soNumber): ?array
+    {
+        $cacheKey = 'sap_order_'.md5(strtoupper(trim($soNumber)));
+        $cacheTtl = config('services.sap.order_cache_ttl', 600);
+
+        return cache()->remember($cacheKey, $cacheTtl, function () use ($soNumber) {
+            $response = Http::timeout($this->timeout)
+                ->acceptJson()
+                ->get("{$this->sapApiUrl}/api/sap/order/detail", [
+                    'soNumber' => trim($soNumber),
+                ]);
+
+            if (! $response->successful()) {
+                Log::warning('Gagal mengambil detail SO dari SAP', [
+                    'so_number' => $soNumber,
+                    'status' => $response->status(),
+                ]);
+
+                return null;
+            }
+
+            return $response->json();
+        });
+    }
+
+    /**
+     * Ambil daftar Sales Order dari SAP (monitor-list-v2).
+     *
+     * Cache 5 menit — list SO cukup sering dipakai di dropdown SoCombobox
+     * namun tidak harus real-time.
+     */
+    public function getSoMonitorList(): ?array
+    {
+        $cacheKey = 'sap_so_monitor_list';
+        $cacheTtl = config('services.sap.monitor_list_cache_ttl', 300);
+
+        return cache()->remember($cacheKey, $cacheTtl, function () {
+            $response = Http::timeout($this->timeout)
+                ->acceptJson()
+                ->get("{$this->sapApiUrl}/api/sap/order/monitor-list-v2");
+
+            if (! $response->successful()) {
+                Log::warning('Gagal mengambil SO monitor list dari SAP', [
+                    'status' => $response->status(),
+                ]);
+
+                return null;
+            }
+
+            return $response->json();
         });
     }
 
@@ -217,6 +329,7 @@ class WansisService
 
         if (count($claims) === 0) {
             Log::warning('WANSIS payload kosong setelah validasi claims', ['ticket_id' => $ticket->id]);
+
             return null;
         }
 
@@ -311,6 +424,7 @@ class WansisService
             $code1 = (string) $code2;
             $code2 = null;
         }
+
         return [$code1, $code2 ?: null, $qty >= 1 ? $qty : 1, $description];
     }
 
